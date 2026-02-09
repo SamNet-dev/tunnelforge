@@ -1062,6 +1062,22 @@ load_profile() {
         log_error "Profile '${name}': REMOTE_HOST contains invalid characters"
         return 1
     fi
+    # Validate LOCAL_BIND_ADDR (used directly in SSH -D/-L/-R commands)
+    if [[ -n "${_profile_ref[LOCAL_BIND_ADDR]:-}" ]] && \
+       ! { validate_ip "${_profile_ref[LOCAL_BIND_ADDR]}" || \
+           validate_ip6 "${_profile_ref[LOCAL_BIND_ADDR]}" || \
+           [[ "${_profile_ref[LOCAL_BIND_ADDR]}" == "localhost" ]] || \
+           [[ "${_profile_ref[LOCAL_BIND_ADDR]}" == "*" ]] || \
+           [[ "${_profile_ref[LOCAL_BIND_ADDR]}" == "0.0.0.0" ]]; }; then
+        log_error "Profile '${name}': LOCAL_BIND_ADDR is not a valid address"
+        return 1
+    fi
+    # Validate OBFS_MODE enum
+    if [[ -n "${_profile_ref[OBFS_MODE]:-}" ]] && \
+       ! [[ "${_profile_ref[OBFS_MODE]}" =~ ^(none|stunnel)$ ]]; then
+        log_error "Profile '${name}': OBFS_MODE must be 'none' or 'stunnel'"
+        return 1
+    fi
 
     log_debug "Profile '${name}' loaded"
 }
@@ -1528,7 +1544,7 @@ start_tunnel() {
                 rmdir "$_st_lock_dir" 2>/dev/null || true
                 continue
             fi
-            if (( ++_st_try >= 20 )); then log_error "Could not acquire lock for '${name}'"; return 1; fi
+            if (( ++_st_try >= 20 )); then log_error "Could not acquire lock for '${name}'"; _st_lock_dir=""; return 1; fi
             sleep 0.5
         done
         printf '%s' "$$" > "${_st_lock_dir}/pid" 2>/dev/null || true
@@ -1772,16 +1788,31 @@ start_tunnel() {
                 _st_unlock; return 1
             fi
 
-            sleep 1
-            local bg_pid=""
-            # Try lsof on the local port first (works for socks5 + local forward)
-            if [[ -n "$local_port" ]]; then
-                bg_pid=$(lsof -ti:"${local_port}" -sTCP:LISTEN 2>/dev/null | head -1) || true
+            # Jump tunnels with multi-hop take longer to bind the listening port
+            local _max_tries=3
+            if [[ -n "${_sp[JUMP_HOSTS]:-}" ]]; then
+                _max_tries=8
+                sleep 2
+            else
+                sleep 1
             fi
-            # Fallback: search for the SSH process
-            if [[ -z "$bg_pid" ]]; then
-                bg_pid=$(pgrep -n -f "ssh.*${ssh_host}" 2>/dev/null) || true
-            fi
+
+            local bg_pid="" _try
+            for (( _try=1; _try<=_max_tries; _try++ )); do
+                # Try lsof on the local port first (works for socks5 + local forward)
+                if [[ -n "$local_port" ]] && [[ -z "$bg_pid" ]]; then
+                    bg_pid=$(lsof -ti:"${local_port}" -sTCP:LISTEN 2>/dev/null | head -1) || true
+                fi
+                # Fallback: search for the SSH process by command line
+                if [[ -z "$bg_pid" ]]; then
+                    bg_pid=$(pgrep -n -f "ssh.*-[DJ].*${ssh_host}" 2>/dev/null) || true
+                fi
+                if [[ -z "$bg_pid" ]]; then
+                    bg_pid=$(pgrep -n -f "ssh.*${ssh_host}" 2>/dev/null) || true
+                fi
+                [[ -n "$bg_pid" ]] && break
+                sleep 1
+            done
 
             if [[ -z "$bg_pid" ]]; then
                 log_error "Could not find SSH process for '${name}'"
@@ -1949,9 +1980,9 @@ stop_tunnel() {
     fi
 
     # Clean up SSH control sockets (stale sockets from %C hash naming)
-    # Find and remove any sockets in the control dir that are no longer active
+    # Use timeout to prevent hanging if remote host is unreachable
     find "${SSH_CONTROL_DIR}" -maxdepth 1 -type s ! -name '.' -exec \
-        sh -c 'ssh -O check -o "ControlPath=$1" dummy 2>/dev/null || rm -f "$1"' _ {} \; 2>/dev/null || true
+        sh -c 'timeout 3 ssh -O check -o "ControlPath=$1" dummy 2>/dev/null || rm -f "$1"' _ {} \; 2>/dev/null || true
 
     if ! kill -0 "$tunnel_pid" 2>/dev/null; then
         rm -f "$tunnel_pid_file" "${tunnel_pid_file}.autossh" "${PID_DIR}/${name}.stunnel" \
@@ -2136,11 +2167,14 @@ get_tunnel_connections() {
     [[ "$port" =~ ^[0-9]+$ ]] || { echo 0; return 0; }
 
     local _nc=0
-    # Count connections on SSH SOCKS port + inbound TLS port if active
-    local _ports_to_check=("$port")
+    # When inbound TLS is active, count only the stunnel port (clients connect there),
+    # otherwise count the SSH SOCKS port. Counting both double-counts connections.
+    local _ports_to_check=()
     local _olp="${_cc[OBFS_LOCAL_PORT]:-0}"
     if [[ "$_olp" =~ ^[0-9]+$ ]] && (( _olp > 0 )); then
-        _ports_to_check+=("$_olp")
+        _ports_to_check=("$_olp")
+    else
+        _ports_to_check=("$port")
     fi
     # Use cached ss output if available (set by dashboard), else run ss
     local _ss_data="${_DASH_SS_CACHE:-}"
@@ -2387,10 +2421,14 @@ enable_kill_switch() {
         local _dns1 _dns2
         _dns1=$(config_get DNS_SERVER_1 "1.1.1.1")
         _dns2=$(config_get DNS_SERVER_2 "1.0.0.1")
-        iptables -A "$_TF_CHAIN" -d "$_dns1" -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-        iptables -A "$_TF_CHAIN" -d "$_dns1" -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
-        iptables -A "$_TF_CHAIN" -d "$_dns2" -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-        iptables -A "$_TF_CHAIN" -d "$_dns2" -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+        if validate_ip "$_dns1" || validate_ip6 "$_dns1"; then
+            iptables -A "$_TF_CHAIN" -d "$_dns1" -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+            iptables -A "$_TF_CHAIN" -d "$_dns1" -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+        fi
+        if validate_ip "$_dns2" || validate_ip6 "$_dns2"; then
+            iptables -A "$_TF_CHAIN" -d "$_dns2" -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+            iptables -A "$_TF_CHAIN" -d "$_dns2" -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+        fi
         # Allow DHCP
         iptables -A "$_TF_CHAIN" -p udp --dport 67:68 -j ACCEPT 2>/dev/null || true
         # Drop everything else
@@ -2698,7 +2736,7 @@ verify_host_fingerprint() {
         return 1
     fi
 
-    while IFS= read -r _fline; do
+    while IFS= read -r _fline || [[ -n "$_fline" ]]; do
         [[ -z "$_fline" ]] && continue
         [[ "$_fline" == \#* ]] && continue
         local _fp
@@ -3492,7 +3530,11 @@ _obfs_write_local_conf() {
         log_error "Cannot write PSK file: $_psk_file"
         return 1
     }
-    chmod 600 "$_psk_file" 2>/dev/null || true
+    if ! chmod 600 "$_psk_file" 2>/dev/null; then
+        log_error "Failed to secure PSK file permissions: $_psk_file"
+        rm -f "$_psk_file" 2>/dev/null || true
+        return 1
+    fi
 
     # Write stunnel config — global options MUST come before [section]
     printf '; TunnelForge inbound TLS+PSK wrapper\n' > "$_conf_file"
@@ -3562,19 +3604,20 @@ _obfs_start_local_stunnel() {
         return 1
     }
 
-    # Wait for PID file
+    # Wait for stunnel to actually listen on the port (not just PID file)
     local _sw
-    for _sw in 1 2 3; do
-        if [[ -f "$_pid_f" ]]; then break; fi
+    for _sw in 1 2 3 4 5; do
+        if is_port_in_use "$_olport" "0.0.0.0"; then break; fi
         sleep 1
     done
 
-    if [[ -f "$_pid_f" ]]; then
+    if is_port_in_use "$_olport" "0.0.0.0"; then
         local _spid=""
         _spid=$(cat "$_pid_f" 2>/dev/null) || true
         log_success "Inbound TLS active on 0.0.0.0:${_olport} → 127.0.0.1:${_lport} (PID: ${_spid:-?})"
     else
-        log_warn "Local stunnel started but PID file missing"
+        log_error "stunnel failed to listen on port ${_olport} (check ${_log_f})"
+        return 1
     fi
     return 0
 }
@@ -4464,6 +4507,7 @@ backup_tunnelforge() {
             log_debug "Rotated old backups"
         fi
     else
+        rm -f "$backup_path" 2>/dev/null || true
         log_error "Failed to create backup"
         return 1
     fi
@@ -5451,8 +5495,8 @@ _tg_process_commands() {
         return 0
     fi
 
-    # Validate chat_id is numeric to prevent injection
-    if ! [[ "$_chat_id" =~ ^[0-9]+$ ]]; then
+    # Validate chat_id is numeric to prevent injection (negative for group chats)
+    if ! [[ "$_chat_id" =~ ^-?[0-9]+$ ]]; then
         log_warn "TG poll: invalid chat_id, skipping"
         return 0
     fi
@@ -6113,7 +6157,7 @@ _read_yn() {
     printf "${BOLD}%s${RESET} ${DIM}[%s]${RESET}: " "$_prompt" "$_hint" >/dev/tty
     read -r _input </dev/tty || true
     _input="${_input:-$_default}"
-    [[ "${_input,,}" == "y" || "${_input,,}" == "yes" ]]
+    if [[ "${_input,,}" == "y" || "${_input,,}" == "yes" ]]; then return 0; else return 1; fi
 }
 
 # Display a numbered selection menu and return 0-based index
@@ -6252,7 +6296,7 @@ _wiz_yn() {
         _WIZ_NAV="back"; return 1
     fi
     _input="${_input:-$_default}"
-    [[ "${_input,,}" == "y" || "${_input,,}" == "yes" ]]
+    if [[ "${_input,,}" == "y" || "${_input,,}" == "yes" ]]; then return 0; else return 1; fi
 }
 
 _wiz_quit() { [[ "$_WIZ_NAV" == "quit" ]]; }
@@ -7396,6 +7440,8 @@ show_learn_menu() {
         printf "\n    ${BOLD}── TLS Obfuscation ──${RESET}\n" >/dev/tty
         printf "    ${CYAN}8${RESET}) What is TLS Obfuscation?\n" >/dev/tty
         printf "    ${CYAN}9${RESET}) PSK Authentication\n" >/dev/tty
+        printf "\n    ${BOLD}── Clients ──${RESET}\n" >/dev/tty
+        printf "    ${CYAN}m${RESET}) Mobile Client Connection\n" >/dev/tty
         printf "\n    ${YELLOW}0${RESET}) Back\n\n" >/dev/tty
 
         local _lm_choice
@@ -7414,6 +7460,7 @@ show_learn_menu() {
             7) _learn_autossh || true ;;
             8) _learn_tls_obfuscation || true ;;
             9) _learn_psk_auth || true ;;
+            m|M) _learn_mobile_client || true ;;
             0|q) return 0 ;;
             *) true ;;
         esac
@@ -7714,6 +7761,74 @@ _learn_psk_auth() {
 '    restart the tunnel, and send the new script only' \
 '    to authorized users. Old PSK stops working.' \
 ''
+    _press_any_key
+}
+
+_learn_mobile_client() {
+    _menu_header "Mobile Client Connection"
+    cat >/dev/tty <<'EOF'
+
+  HOW TO CONNECT FROM A MOBILE PHONE
+
+  Your TunnelForge tunnel runs on a server and exposes a SOCKS5
+  port. To use it from a phone, you need a SOCKS5-capable app.
+
+  ┌──────────┐    SOCKS5    ┌──────────────┐    SSH    ┌──────┐
+  │  Phone   ├─────────────>│  VPS/Server  ├─────────>│ Dest │
+  │  App     │  proxy conn  │  TunnelForge │  tunnel  │      │
+  └──────────┘              └──────────────┘          └──────┘
+
+  ── WITHOUT TLS/PSK (bind 0.0.0.0) ──
+
+    Make sure your profile uses LOCAL_BIND_ADDR=0.0.0.0 so
+    the SOCKS5 port accepts external connections.
+
+    Android:
+      • SocksDroid (free)   — set SOCKS5: <server_ip>:<port>
+      • Drony               — per-app SOCKS5 routing
+      • Any browser with proxy settings
+
+    iOS:
+      • Shadowrocket        — add SOCKS5 server
+      • Surge / Quantumult  — SOCKS5 proxy node
+      • iOS WiFi Settings   — HTTP proxy (limited)
+
+    Settings:
+      Type:    SOCKS5
+      Server:  <your_server_ip>
+      Port:    <LOCAL_PORT from profile>
+
+    WARNING: Without PSK, anyone who finds the port can use
+    your tunnel. Enable inbound TLS+PSK for protection.
+
+  ── WITH TLS+PSK (recommended) ──
+
+    When inbound TLS+PSK is enabled, stunnel wraps the SOCKS5
+    port. Mobile clients need an stunnel-compatible layer:
+
+    Android:
+      1. Install SST (Simple Stunnel Tunnel) or Termux
+      2. In Termux: pkg install stunnel, then use the config
+         from: tunnelforge client-config <profile>
+      3. Point your SOCKS5 app at 127.0.0.1:<OBFS_LOCAL_PORT>
+
+    iOS:
+      1. Shadowrocket supports TLS-over-SOCKS natively
+      2. Or use iSH terminal + stunnel with client config
+
+    Generate client config:
+      tunnelforge client-config <profile>
+      tunnelforge client-script <profile>
+
+  ── QUICK CHECKLIST ──
+
+    [ ] Server tunnel is running   (tunnelforge status)
+    [ ] Firewall allows the port   (ufw allow <port>)
+    [ ] Phone and server on same network, or port is public
+    [ ] SOCKS5 app configured with correct IP:PORT
+    [ ] If PSK: stunnel running on phone with correct key
+
+EOF
     _press_any_key
 }
 
