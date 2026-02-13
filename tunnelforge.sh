@@ -147,6 +147,7 @@ declare -gA CONFIG=(
     [AUTOSSH_POLL]="30"
     [AUTOSSH_FIRST_POLL]="30"
     [AUTOSSH_GATETIME]="30"
+
     [AUTOSSH_MONITOR_PORT]="0"
     [AUTOSSH_LOG_LEVEL]="1"
 
@@ -169,7 +170,7 @@ declare -gA CONFIG=(
     [TELEGRAM_STATUS_INTERVAL]="3600"
 
     # Dashboard
-    [DASHBOARD_REFRESH]="3"
+    [DASHBOARD_REFRESH]="5"
     [DASHBOARD_THEME]="retro"
 
     # Logging
@@ -1180,14 +1181,14 @@ delete_profile() {
 }
 
 list_profiles() {
-    if [[ ! -d "$PROFILES_DIR" ]] || \
-       [[ -z "$(ls -A "$PROFILES_DIR" 2>/dev/null)" ]]; then
-        return 0
-    fi
-    local f
+    [[ -d "$PROFILES_DIR" ]] || return 0
+    local f _base
     for f in "${PROFILES_DIR}"/*.conf; do
         [[ -f "$f" ]] || continue
-        basename "$f" .conf
+        # Extract profile name without forking basename
+        _base="${f##*/}"      # strip directory
+        _base="${_base%.conf}" # strip .conf extension
+        printf '%s\n' "$_base"
     done
 }
 
@@ -1474,12 +1475,11 @@ _log_file() { echo "${LOG_DIR}/${1}.log"; }
 
 is_tunnel_running() {
     local name="$1"
-    local pid_file
-    pid_file=$(_pid_file "$name")
+    local pid_file="${PID_DIR}/${name}.pid"
     [[ -f "$pid_file" ]] || return 1
 
-    local pid
-    pid=$(cat "$pid_file" 2>/dev/null) || true
+    local pid=""
+    read -r pid < "$pid_file" 2>/dev/null || true
     if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
         return 1
     fi
@@ -1488,11 +1488,10 @@ is_tunnel_running() {
 
 _clean_stale_pid() {
     local name="$1"
-    local pid_file
-    pid_file=$(_pid_file "$name")
+    local pid_file="${PID_DIR}/${name}.pid"
     [[ -f "$pid_file" ]] || return 0
-    local pid
-    pid=$(cat "$pid_file" 2>/dev/null) || true
+    local pid=""
+    read -r pid < "$pid_file" 2>/dev/null || true
     if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
         rm -f "$pid_file" "${pid_file}.autossh" "${PID_DIR}/${name}.stunnel" \
              "${PID_DIR}/${name}.started" "${PID_DIR}/${name}.askpass" "${PID_DIR}/${name}.pass" 2>/dev/null
@@ -1501,10 +1500,11 @@ _clean_stale_pid() {
 }
 
 get_tunnel_pid() {
-    local pid_file
-    pid_file=$(_pid_file "$1")
+    local pid_file="${PID_DIR}/${1}.pid"
     if [[ -f "$pid_file" ]]; then
-        cat "$pid_file" 2>/dev/null || true
+        local _pid=""
+        read -r _pid < "$pid_file" 2>/dev/null || true
+        printf '%s' "$_pid"
     fi
     return 0
 }
@@ -1960,8 +1960,8 @@ stop_tunnel() {
     # Kill autossh parent first (if present) — it handles SSH child cleanup
     local _autossh_parent_file="${tunnel_pid_file}.autossh"
     if [[ -f "$_autossh_parent_file" ]]; then
-        local _as_parent_pid
-        _as_parent_pid=$(cat "$_autossh_parent_file" 2>/dev/null) || true
+        local _as_parent_pid=""
+        read -r _as_parent_pid < "$_autossh_parent_file" 2>/dev/null || true
         if [[ -n "$_as_parent_pid" ]] && kill -0 "$_as_parent_pid" 2>/dev/null; then
             kill "$_as_parent_pid" 2>/dev/null || true
         fi
@@ -1988,6 +1988,7 @@ stop_tunnel() {
     if ! kill -0 "$tunnel_pid" 2>/dev/null; then
         rm -f "$tunnel_pid_file" "${tunnel_pid_file}.autossh" "${PID_DIR}/${name}.stunnel" \
              "${PID_DIR}/${name}.started" "${PID_DIR}/${name}.askpass" "${PID_DIR}/${name}.pass" 2>/dev/null || true
+        unset '_SSH_PID_CACHE[$name]' 2>/dev/null || true
         log_success "Tunnel '${name}' stopped"
         log_file "info" "Tunnel '${name}' stopped" || true
         _notify_tunnel_stop "$name" || true
@@ -2094,69 +2095,126 @@ get_tunnel_uptime() {
     [[ -z "$pid" ]] && { echo 0; return 0; }
     kill -0 "$pid" 2>/dev/null || { echo 0; return 0; }
 
+    local _now
+    printf -v _now '%(%s)T' -1
+
     # Primary: startup timestamp file (most reliable, survives across invocations)
     local _started_file="${PID_DIR}/${name}.started"
     if [[ -f "$_started_file" ]]; then
-        local _st_epoch
-        _st_epoch=$(cat "$_started_file" 2>/dev/null) || true
+        local _st_epoch=""
+        read -r _st_epoch < "$_started_file" 2>/dev/null || true
         if [[ "$_st_epoch" =~ ^[0-9]+$ ]]; then
-            echo $(( $(date +%s) - _st_epoch ))
+            echo $(( _now - _st_epoch ))
             return 0
         fi
     fi
 
-    # Fallback 1: /proc/PID/stat (Linux only)
+    # Fallback 1: /proc/PID/stat (Linux only, pure bash — no awk forks)
     if [[ -f "/proc/${pid}/stat" ]]; then
-        local start_ticks clk_tck boot_time
-        start_ticks=$(awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null || true)
+        local _stat_line=""
+        read -r _stat_line < "/proc/${pid}/stat" 2>/dev/null || true
+        # Field 22 is starttime (in clock ticks). Fields are space-delimited
+        # but field 2 (comm) can contain spaces in parens. Strip it first.
+        _stat_line="${_stat_line#*(}"   # remove up to first (
+        _stat_line="${_stat_line#*) }"  # remove up to ") "
+        # Now field 1=state, ... field 20=starttime (22 - 2 comm fields)
+        local -a _sf
+        read -ra _sf <<< "$_stat_line"
+        local start_ticks="${_sf[19]:-}"
+        local clk_tck
         clk_tck=$(getconf CLK_TCK 2>/dev/null || echo 100)
         [[ "$clk_tck" =~ ^[0-9]+$ ]] || clk_tck=100
-        boot_time=$(awk '/btime/ {print $2}' /proc/stat 2>/dev/null || true)
+
+        local boot_time=""
+        local _bkey _bval
+        while read -r _bkey _bval; do
+            [[ "$_bkey" == "btime" ]] && { boot_time="$_bval"; break; }
+        done < /proc/stat 2>/dev/null
 
         if [[ "$start_ticks" =~ ^[0-9]+$ ]] && [[ "$boot_time" =~ ^[0-9]+$ ]]; then
             local start_sec=$(( boot_time + start_ticks / clk_tck ))
-            echo $(( $(date +%s) - start_sec ))
+            echo $(( _now - start_sec ))
             return 0
         fi
     fi
 
     # Fallback 2: PID file mtime
-    local pf
-    pf=$(_pid_file "$name")
+    local pf="${PID_DIR}/${name}.pid"
     if [[ -f "$pf" ]]; then
         local ft
         ft=$(stat -c %Y "$pf" 2>/dev/null || stat -f %m "$pf" 2>/dev/null) || true
         if [[ -n "$ft" ]]; then
-            echo $(( $(date +%s) - ft )); return 0
+            echo $(( _now - ft )); return 0
         fi
     fi
     echo 0; return 0
 }
 
+# Cache: tunnel name → resolved SSH child PID (avoids re-walking tree every frame)
+declare -gA _SSH_PID_CACHE=()
+
 get_tunnel_traffic() {
+    local _name="$1"
     local pid
-    pid=$(get_tunnel_pid "$1")
+    pid=$(get_tunnel_pid "$_name")
     if [[ -z "$pid" ]] || [[ ! -d "/proc/${pid}" ]]; then
+        unset '_SSH_PID_CACHE[$_name]' 2>/dev/null || true
         echo "0 0"; return 0
     fi
-    # Walk process tree to find actual ssh process (autossh/sshpass are wrappers)
-    local _target="$pid" _try
-    for _try in 1 2 3; do
-        local _comm=""
-        _comm=$(cat "/proc/${_target}/comm" 2>/dev/null) || true
-        [[ "$_comm" == "ssh" ]] && break
-        local _next=""
-        _next=$(pgrep -P "$_target" 2>/dev/null | head -1) || true
-        [[ -z "$_next" ]] && break
-        _target="$_next"
-    done
+
+    # Check cached SSH child PID first
+    local _target="${_SSH_PID_CACHE[$_name]:-}"
+    if [[ -n "$_target" ]] && [[ -d "/proc/${_target}" ]]; then
+        # Cache hit — verify it's still alive
+        :
+    else
+        # Walk process tree to find actual ssh process (autossh/sshpass are wrappers)
+        # Uses /proc/PID/task/*/children (no fork) instead of pgrep -P
+        _target="$pid"
+        local _try _comm=""
+        for _try in 1 2 3; do
+            _comm=""
+            read -r _comm < "/proc/${_target}/comm" 2>/dev/null || true
+            [[ "$_comm" == "ssh" ]] && break
+            # Read first child PID from /proc without forking pgrep
+            local _next=""
+            if [[ -f "/proc/${_target}/task/${_target}/children" ]]; then
+                read -r _next _ < "/proc/${_target}/task/${_target}/children" 2>/dev/null || true
+            fi
+            [[ -z "$_next" ]] && break
+            _target="$_next"
+        done
+        _SSH_PID_CACHE["$_name"]="$_target"
+    fi
+
     if [[ ! -f "/proc/${_target}/io" ]]; then
         echo "0 0"; return 0
     fi
-    local rchar wchar
-    rchar=$(awk '/^rchar:/ {print $2}' "/proc/${_target}/io" 2>/dev/null || echo 0)
-    wchar=$(awk '/^wchar:/ {print $2}' "/proc/${_target}/io" 2>/dev/null || echo 0)
+    # Read rchar/wchar with a single while-read loop (no awk forks)
+    local _key _val rchar=0 wchar=0
+    while read -r _key _val; do
+        case "$_key" in
+            rchar:) rchar="$_val" ;;
+            wchar:) wchar="$_val"; break ;;  # wchar comes after rchar, stop early
+        esac
+    done < "/proc/${_target}/io" 2>/dev/null
     echo "${rchar} ${wchar}"
+}
+
+# Count ESTABLISHED connections on a port from ss data (pure bash, no grep fork)
+# Usage: _count_port_conns PORT [ss_data_var]
+_count_port_conns() {
+    local _cpc_port="$1" _cpc_data="${2:-${_DASH_SS_CACHE:-}}"
+    if [[ -z "$_cpc_data" ]]; then
+        _cpc_data=$(ss -tn 2>/dev/null) || true
+    fi
+    local _cpc_count=0 _cpc_line
+    while IFS= read -r _cpc_line; do
+        [[ "$_cpc_line" == *ESTAB* ]] || continue
+        [[ "$_cpc_line" == *":${_cpc_port} "* ]] || [[ "$_cpc_line" == *":${_cpc_port}	"* ]] || continue
+        (( ++_cpc_count )) || true
+    done <<< "$_cpc_data"
+    echo "$_cpc_count"
 }
 
 get_tunnel_connections() {
@@ -2167,28 +2225,13 @@ get_tunnel_connections() {
     [[ -z "$port" ]] && { echo 0; return 0; }
     [[ "$port" =~ ^[0-9]+$ ]] || { echo 0; return 0; }
 
-    local _nc=0
-    # When inbound TLS is active, count only the stunnel port (clients connect there),
-    # otherwise count the SSH SOCKS port. Counting both double-counts connections.
-    local _ports_to_check=()
+    # When inbound TLS is active, count only the stunnel port
     local _olp="${_cc[OBFS_LOCAL_PORT]:-0}"
     if [[ "$_olp" =~ ^[0-9]+$ ]] && (( _olp > 0 )); then
-        _ports_to_check=("$_olp")
+        _count_port_conns "$_olp"
     else
-        _ports_to_check=("$port")
+        _count_port_conns "$port"
     fi
-    # Use cached ss output if available (set by dashboard), else run ss
-    local _ss_data="${_DASH_SS_CACHE:-}"
-    if [[ -z "$_ss_data" ]]; then
-        _ss_data=$(ss -tn 2>/dev/null) || true
-    fi
-    local _p
-    for _p in "${_ports_to_check[@]}"; do
-        local _cnt=0
-        _cnt=$(echo "$_ss_data" | grep -cE "ESTAB.*:${_p}[[:space:]]") || true
-        (( _nc += _cnt )) || true
-    done
-    echo "${_nc:-0}"
 }
 
 # ============================================================================
@@ -7341,7 +7384,7 @@ show_settings_menu() {
         printf "    ${CYAN}6${RESET}) AutoSSH Poll       : ${BOLD}%s${RESET}s\n" "$(config_get AUTOSSH_POLL 30)" >/dev/tty
         printf "    ${CYAN}7${RESET}) ControlMaster      : ${BOLD}%s${RESET}\n"  "$(config_get CONTROLMASTER_ENABLED false)" >/dev/tty
         printf "    ${CYAN}8${RESET}) Log Level          : ${BOLD}%s${RESET}\n"  "$(config_get LOG_LEVEL info)" >/dev/tty
-        printf "    ${CYAN}9${RESET}) Dashboard Refresh  : ${BOLD}%s${RESET}s\n" "$(config_get DASHBOARD_REFRESH 3)" >/dev/tty
+        printf "    ${CYAN}9${RESET}) Dashboard Refresh  : ${BOLD}%s${RESET}s\n" "$(config_get DASHBOARD_REFRESH 5)" >/dev/tty
         printf "\n    ${YELLOW}0${RESET}) Back\n\n" >/dev/tty
 
         local _sm_choice
@@ -7401,7 +7444,7 @@ show_settings_menu() {
                     config_set "LOG_LEVEL" "${_ll_opts[$_ll_idx]}"
                     save_settings || true
                 fi ;;
-            9)  local val; _read_tty "  Dashboard refresh rate (seconds)" val "$(config_get DASHBOARD_REFRESH 3)" || true
+            9)  local val; _read_tty "  Dashboard refresh rate (seconds)" val "$(config_get DASHBOARD_REFRESH 5)" || true
                 if [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 1 )); then
                     config_set "DASHBOARD_REFRESH" "$val"; save_settings || true
                 else
@@ -8906,35 +8949,46 @@ declare -gi _DASH_PAGE=0              # current page (0-indexed)
 declare -gi _DASH_PER_PAGE=4          # tunnels per page
 declare -gi _DASH_TOTAL_PAGES=1       # computed per render
 
-# Record a bandwidth sample to history
+# Record a bandwidth sample to history (optimized: zero forks in hot path)
+declare -gA _BW_WRITE_COUNT=()   # per-tunnel write counter for throttled trim
 _bw_record() {
     local name="$1" rx="$2" tx="$3"
     local bw_file="${BW_HISTORY_DIR}/${name}.dat"
-    mkdir -p "$BW_HISTORY_DIR" 2>/dev/null || true
+    [[ -d "$BW_HISTORY_DIR" ]] || mkdir -p "$BW_HISTORY_DIR" 2>/dev/null || true
 
     # Light mkdir lock for append+trim
     local _bw_lock="${bw_file}.lck"
     local _bw_try=0
     while ! mkdir "$_bw_lock" 2>/dev/null; do
         local _bw_stale_pid=""
-        _bw_stale_pid=$(cat "${_bw_lock}/pid" 2>/dev/null) || true
+        read -r _bw_stale_pid < "${_bw_lock}/pid" 2>/dev/null || true
         if [[ -n "$_bw_stale_pid" ]] && ! kill -0 "$_bw_stale_pid" 2>/dev/null; then
             rm -f "${_bw_lock}/pid" 2>/dev/null || true
             rmdir "$_bw_lock" 2>/dev/null || true
             continue
         fi
-        if (( ++_bw_try >= 5 )); then return 0; fi
+        if (( ++_bw_try >= 3 )); then return 0; fi
         sleep 0.1
     done
     printf '%s' "$$" > "${_bw_lock}/pid" 2>/dev/null || true
 
-    printf "%d %d %d\n" "$(date +%s)" "$rx" "$tx" >> "$bw_file" 2>/dev/null || true
+    # printf '%(%s)T' is a bash 4.2+ builtin — no fork needed for timestamp
+    local _now_epoch
+    printf -v _now_epoch '%(%s)T' -1
+    printf "%d %d %d\n" "$_now_epoch" "$rx" "$tx" >> "$bw_file" 2>/dev/null || true
 
-    # Keep last 120 samples (10 min at 5s interval)
-    if [[ -f "$bw_file" ]]; then
-        local lines
-        lines=$(wc -l < "$bw_file" 2>/dev/null || echo 0)
-        if (( lines > 120 )); then
+    # Throttle trimming: only check every 10 writes (not every single write)
+    local _wc=${_BW_WRITE_COUNT[$name]:-0}
+    (( ++_wc )) || true
+    _BW_WRITE_COUNT["$name"]=$_wc
+    if (( _wc >= 10 )); then
+        _BW_WRITE_COUNT["$name"]=0
+        # Count lines without forking wc
+        local _line_count=0
+        while IFS= read -r _; do
+            (( ++_line_count )) || true
+        done < "$bw_file" 2>/dev/null
+        if (( _line_count > 120 )); then
             local tmp_bw_file="${bw_file}.tmp"
             if tail -n 120 "$bw_file" > "$tmp_bw_file" 2>/dev/null; then
                 mv "$tmp_bw_file" "$bw_file" 2>/dev/null || rm -f "$tmp_bw_file" 2>/dev/null
@@ -8948,7 +9002,7 @@ _bw_record() {
     rmdir "$_bw_lock" 2>/dev/null || true
 }
 
-# Read last N bandwidth deltas from history
+# Read last N bandwidth deltas from history (optimized: no regex per line)
 _bw_read_deltas() {
     local name="$1" count="${2:-30}"
     local bw_file="${BW_HISTORY_DIR}/${name}.dat"
@@ -8956,10 +9010,9 @@ _bw_read_deltas() {
 
     local -a timestamps rx_vals tx_vals
     local ts rx tx
+    # Data file is our own trusted format (epoch rx tx per line) — skip regex
     while read -r ts rx tx; do
-        [[ "$ts" =~ ^[0-9]+$ ]] || continue
-        [[ "$rx" =~ ^[0-9]+$ ]] || continue
-        [[ "$tx" =~ ^[0-9]+$ ]] || continue
+        [[ -z "$ts" ]] && continue
         timestamps+=("$ts")
         rx_vals+=("$rx")
         tx_vals+=("$tx")
@@ -8968,12 +9021,12 @@ _bw_read_deltas() {
     local total=${#timestamps[@]}
     if (( total < 2 )); then return 0; fi
 
-    local _i
+    local _i dt drx dtx
     for (( _i=1; _i<total; _i++ )); do
-        local dt=$(( timestamps[_i] - timestamps[_i-1] ))
+        dt=$(( timestamps[_i] - timestamps[_i-1] ))
         if (( dt < 1 )); then dt=1; fi
-        local drx=$(( (rx_vals[_i] - rx_vals[_i-1]) / dt ))
-        local dtx=$(( (tx_vals[_i] - tx_vals[_i-1]) / dt ))
+        drx=$(( (rx_vals[_i] - rx_vals[_i-1]) / dt ))
+        dtx=$(( (tx_vals[_i] - tx_vals[_i-1]) / dt ))
         if (( drx < 0 )); then drx=0; fi
         if (( dtx < 0 )); then dtx=0; fi
         echo "$drx $dtx"
@@ -9017,10 +9070,14 @@ _reconnect_stats() {
     local rlog="${RECONNECT_LOG_DIR}/${name}.log"
     [[ -f "$rlog" ]] || { echo "0 -"; return 0; }
 
-    local total last_ts
-    total=$(wc -l < "$rlog" 2>/dev/null || echo 0)
-    last_ts=$(tail -n 1 "$rlog" 2>/dev/null | cut -d'|' -f1 || true)
-    echo "${total} ${last_ts:--}"
+    # Count lines + capture last line in one pass (no wc/tail/cut forks)
+    local _total=0 _last_line=""
+    while IFS= read -r _last_line; do
+        (( ++_total )) || true
+    done < "$rlog" 2>/dev/null
+    # Extract timestamp (before first '|')
+    local _last_ts="${_last_line%%|*}"
+    echo "${_total} ${_last_ts:--}"
     return 0
 }
 
@@ -9110,52 +9167,62 @@ _dash_box_mid() {
 }
 
 # Pure-bash ANSI escape sequence stripping (avoids sed fork per call)
-_strip_ansi() {
-    local s="$1" out="" _esc=$'\033'
-    while [[ -n "$s" ]]; do
-        if [[ "$s" == "${_esc}["* ]]; then
-            # Skip CSI sequence: ESC [ ... letter
-            s="${s#"${_esc}["}"
-            while [[ -n "$s" ]] && [[ "$s" != [a-zA-Z]* ]]; do
-                s="${s:1}"
+# Store ANSI-stripped string directly into caller's variable (no subshell fork)
+# Usage: _strip_ansi_v RESULT_VAR "string with \e[31mcolors\e[0m"
+_strip_ansi_v() {
+    local -n _sav_ref="$1"
+    local _sav_s="$2" _sav_out="" _sav_esc=$'\033'
+    while [[ -n "$_sav_s" ]]; do
+        if [[ "$_sav_s" == "${_sav_esc}["* ]]; then
+            _sav_s="${_sav_s#"${_sav_esc}["}"
+            while [[ -n "$_sav_s" ]] && [[ "$_sav_s" != [a-zA-Z]* ]]; do
+                _sav_s="${_sav_s:1}"
             done
-            s="${s:1}"  # skip the final letter
-        elif [[ "$s" == "${_esc}("* ]]; then
-            s="${s:3}"  # skip ESC ( letter
-        elif [[ "$s" == "${_esc}"* ]]; then
-            s="${s:1}"  # unknown ESC, skip ESC char
+            _sav_s="${_sav_s:1}"
+        elif [[ "$_sav_s" == "${_sav_esc}("* ]]; then
+            _sav_s="${_sav_s:3}"
+        elif [[ "$_sav_s" == "${_sav_esc}"* ]]; then
+            _sav_s="${_sav_s:1}"
         else
-            out+="${s:0:1}"
-            s="${s:1}"
+            _sav_out+="${_sav_s:0:1}"
+            _sav_s="${_sav_s:1}"
         fi
     done
-    printf '%s' "$out"
+    _sav_ref="$_sav_out"
+}
+
+# Legacy wrapper for non-hot-path callers (uses subshell)
+_strip_ansi() {
+    local _sa_result=""
+    _strip_ansi_v _sa_result "$1"
+    printf '%s' "$_sa_result"
 }
 
 # ── Dashboard helper: system resources (cached 5s) ──
 _dash_system_resources() {
     local now
-    now=$(date +%s)
+    printf -v now '%(%s)T' -1
     if [[ -n "$_DASH_SYSRES" ]] && (( now - _DASH_SYSRES_TS < 5 )); then
         return 0
     fi
 
-    # CPU% from /proc/stat (instantaneous idle delta would need 2 reads;
-    # use /proc/loadavg instead for a lightweight single-read approach)
+    # Load averages (single read, no forks)
     local load_1="" load_5="" load_15=""
     if [[ -f /proc/loadavg ]]; then
         read -r load_1 load_5 load_15 _ _ < /proc/loadavg 2>/dev/null || true
     fi
 
-    # Memory from /proc/meminfo
+    # Memory from /proc/meminfo (pure bash, no grep/awk forks)
     local mem_total=0 mem_avail=0 mem_used=0 mem_pct=0
     if [[ -f /proc/meminfo ]]; then
-        local _mt _ma
-        _mt=$(grep -m1 '^MemTotal:' /proc/meminfo 2>/dev/null | awk '{print $2}') || true
-        _ma=$(grep -m1 '^MemAvailable:' /proc/meminfo 2>/dev/null | awk '{print $2}') || true
-        if [[ "$_mt" =~ ^[0-9]+$ ]] && [[ "$_ma" =~ ^[0-9]+$ ]] && (( _mt > 0 )); then
-            mem_total=$(( _mt / 1024 ))   # MB
-            mem_avail=$(( _ma / 1024 ))
+        local _key _val _unit
+        while read -r _key _val _unit; do
+            case "$_key" in
+                MemTotal:)     mem_total=$(( _val / 1024 )) ;;
+                MemAvailable:) mem_avail=$(( _val / 1024 )); break ;;
+            esac
+        done < /proc/meminfo 2>/dev/null
+        if (( mem_total > 0 )); then
             mem_used=$(( mem_total - mem_avail ))
             mem_pct=$(( mem_used * 100 / mem_total ))
         fi
@@ -9163,10 +9230,10 @@ _dash_system_resources() {
 
     local mem_str
     if (( mem_total >= 1024 )); then
-        local _mu_g _mt_g
-        _mu_g=$(awk "BEGIN{printf \"%.1f\", ${mem_used}/1024}") || true
-        _mt_g=$(awk "BEGIN{printf \"%.1f\", ${mem_total}/1024}") || true
-        mem_str="${_mu_g}G/${_mt_g}G (${mem_pct}%)"
+        # Integer GB with one decimal via bash math (no awk fork)
+        local _mu_whole=$(( mem_used / 1024 )) _mu_frac=$(( (mem_used % 1024) * 10 / 1024 ))
+        local _mt_whole=$(( mem_total / 1024 )) _mt_frac=$(( (mem_total % 1024) * 10 / 1024 ))
+        mem_str="${_mu_whole}.${_mu_frac}G/${_mt_whole}.${_mt_frac}G (${mem_pct}%)"
     elif (( mem_total > 0 )); then
         mem_str="${mem_used}M/${mem_total}M (${mem_pct}%)"
     else
@@ -9178,13 +9245,14 @@ _dash_system_resources() {
     return 0
 }
 
-# ── Dashboard helper: active connections on a port ──
+# ── Dashboard helper: active connections on a port (optimized: no awk forks) ──
 _dash_active_conns() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] || { echo "0 clients"; return 0; }
 
-    local -a _ips=()
-    local _line _src
+    local -A _seen=()
+    local -a _unique=()
+    local _line
     # Use cached ss output if available (set by _dash_render), else run ss
     local _ss_data="${_DASH_SS_CACHE:-}"
     if [[ -z "$_ss_data" ]]; then
@@ -9192,23 +9260,19 @@ _dash_active_conns() {
     fi
     while IFS= read -r _line; do
         [[ -z "$_line" ]] && continue
-        # ss output: State Recv-Q Send-Q Local:Port Peer:Port Process
-        _src=$(echo "$_line" | awk '{print $5}') || true
+        # Extract peer address via bash string ops (no awk fork)
+        # ss output: ESTAB  0  0  local:port  peer:port
+        local _rest="${_line#*ESTAB}"
+        [[ "$_rest" == "$_line" ]] && continue  # not ESTAB
+        # Split on whitespace: skip recv-q, send-q, local addr; get peer addr
+        read -r _ _ _ _src <<< "$_rest" || continue
         # Strip port: 192.168.1.5:43210 → 192.168.1.5
         _src="${_src%:*}"
-        [[ -n "$_src" ]] && _ips+=("$_src")
-    done < <(echo "$_ss_data" | grep -E "ESTAB.*:${port}[[:space:]]" || true)
-
-    # Deduplicate IPs
-    local -A _seen=()
-    local -a _unique=()
-    local _ip
-    for _ip in "${_ips[@]}"; do
-        if [[ -z "${_seen[$_ip]:-}" ]]; then
-            _seen["$_ip"]=1
-            _unique+=("$_ip")
+        if [[ -n "$_src" ]] && [[ -z "${_seen[$_src]:-}" ]]; then
+            _seen["$_src"]=1
+            _unique+=("$_src")
         fi
-    done
+    done < <(echo "$_ss_data" | grep -F ":${port}" || true)
 
     local count=${#_unique[@]}
     if (( count == 0 )); then
@@ -9230,7 +9294,7 @@ _dash_active_conns() {
 _dash_latency_cached() {
     local name="$1" host="$2" port="${3:-22}"
     local now
-    now=$(date +%s)
+    printf -v now '%(%s)T' -1
 
     # Cache by host:port (not tunnel name) so multiple tunnels to same server share one check
     local _cache_key="${host}:${port}"
@@ -9283,8 +9347,7 @@ _dash_render() {
     # Fixed overhead: header(8) + colhdr(3) + sysres(3) + active_conn_hdr(2) + log(4)
     #   + reconnect(4) + sysinfo(2) + footer(3) = ~29 lines
     # Per tunnel on page: ~5 lines (status + sparkline + route + auth + active_conn_row)
-    local _term_h
-    _term_h=$(tput lines 2>/dev/null) || _term_h=40
+    local _term_h="${_DASH_TERM_H:-40}"
     local _overhead=29
     _DASH_PER_PAGE=$(( (_term_h - _overhead) / 5 ))
     if (( _DASH_PER_PAGE < 2 )); then _DASH_PER_PAGE=2; fi
@@ -9319,7 +9382,7 @@ _dash_render() {
 
     # Subtitle
     local now_ts
-    now_ts=$(date '+%Y-%m-%d %H:%M:%S')
+    printf -v now_ts '%(%Y-%m-%d %H:%M:%S)T' -1
     local _page_ind=""
     if (( _DASH_TOTAL_PAGES > 1 )); then
         _page_ind="  │  Page $(( _DASH_PAGE + 1 ))/${_DASH_TOTAL_PAGES}"
@@ -9342,7 +9405,7 @@ _dash_render() {
         "TUNNEL" "TYPE" "STATUS" "LOCAL" "TRAFFIC" "CONNS" "UPTIME")
     printf "${BOLD_GREEN}║${RESET}%s" "$hdr"
     local hdr_stripped
-    hdr_stripped=$(_strip_ansi "$hdr")
+    _strip_ansi_v hdr_stripped "$hdr"
     local hdr_len=${#hdr_stripped}
     local _hdr_pad=$(( width - hdr_len - 2 ))
     if (( _hdr_pad < 0 )); then _hdr_pad=0; fi
@@ -9409,7 +9472,13 @@ _dash_render() {
                 [[ "$wchar" =~ ^[0-9]+$ ]] || wchar=0
                 total=$(( rchar + wchar ))
                 traf_str=$(format_bytes "$total")
-                conns=$(get_tunnel_connections "$_dname" 2>/dev/null || true)
+                # Inline connection count — profile already loaded, skip redundant load_profile
+                local _conn_port="${_dp[LOCAL_PORT]:-}"
+                local _conn_olp="${_dp[OBFS_LOCAL_PORT]:-0}"
+                if [[ "$_conn_olp" =~ ^[0-9]+$ ]] && (( _conn_olp > 0 )); then
+                    _conn_port="$_conn_olp"
+                fi
+                conns=$(_count_port_conns "$_conn_port" 2>/dev/null || true)
                 : "${conns:=0}"
 
                 # Record bandwidth for sparkline
@@ -9420,7 +9489,7 @@ _dash_render() {
                     "$_dname_display" "${dtype^^}" "ALIVE" "$daddr" "$traf_str" "$conns" "$up_str")
                 printf "${BOLD_GREEN}║${RESET}%s" "$row"
                 local row_stripped
-                row_stripped=$(_strip_ansi "$row")
+                _strip_ansi_v row_stripped "$row"
                 local row_len=${#row_stripped}
                 local _row_pad=$(( width - row_len - 2 ))
                 if (( _row_pad < 0 )); then _row_pad=0; fi
@@ -9454,7 +9523,7 @@ _dash_render() {
                         "" "$spark_str" "$rate_str" "$peak_str")
                     printf "${BOLD_GREEN}║${RESET}%s" "$spark_row"
                     local spark_stripped
-                    spark_stripped=$(_strip_ansi "$spark_row")
+                    _strip_ansi_v spark_stripped "$spark_row"
                     local spark_len=${#spark_stripped}
                     local _sp_pad=$(( width - spark_len - 2 ))
                     if (( _sp_pad < 0 )); then _sp_pad=0; fi
@@ -9480,7 +9549,7 @@ _dash_render() {
                     _rr=$(printf " ${DIM}%-13s${RESET}${DIM}%s${RESET}" "" "$_route_str")
                     printf "${BOLD_GREEN}║${RESET}%s" "$_rr"
                     local _rr_s
-                    _rr_s=$(_strip_ansi "$_rr")
+                    _strip_ansi_v _rr_s "$_rr"
                     local _rr_pad=$(( width - ${#_rr_s} - 2 ))
                     if (( _rr_pad < 0 )); then _rr_pad=0; fi
                     printf '%*s' "$_rr_pad" ""
@@ -9521,7 +9590,7 @@ _dash_render() {
                     "" "$_auth_method" "$_lat_rating" "$_lat_icon" "$_obfs_ind")
                 printf "${BOLD_GREEN}║${RESET}%s" "$_ar"
                 local _ar_s
-                _ar_s=$(_strip_ansi "$_ar")
+                _strip_ansi_v _ar_s "$_ar"
                 local _ar_pad=$(( width - ${#_ar_s} - 2 ))
                 if (( _ar_pad < 0 )); then _ar_pad=0; fi
                 printf '%*s' "$_ar_pad" ""
@@ -9548,7 +9617,7 @@ _dash_render() {
                     _sr=$(printf " ${DIM}%-13s${RESET}${DIM}security:${RESET} dns %s  kill %s" "" "$_dns_ind" "$_kill_ind")
                     printf "${BOLD_GREEN}║${RESET}%s" "$_sr"
                     local _sr_s
-                    _sr_s=$(_strip_ansi "$_sr")
+                    _strip_ansi_v _sr_s "$_sr"
                     local _sr_pad=$(( width - ${#_sr_s} - 2 ))
                     if (( _sr_pad < 0 )); then _sr_pad=0; fi
                     printf '%*s' "$_sr_pad" ""
@@ -9560,7 +9629,7 @@ _dash_render() {
                     "$_dname_display" "${dtype^^}" "STOP" "$daddr" "-" "-" "-")
                 printf "${BOLD_GREEN}║${RESET}%s" "$row"
                 local row_stripped
-                row_stripped=$(_strip_ansi "$row")
+                _strip_ansi_v row_stripped "$row"
                 local row_len=${#row_stripped}
                 local _row_pad=$(( width - row_len - 2 ))
                 if (( _row_pad < 0 )); then _row_pad=0; fi
@@ -9587,7 +9656,7 @@ _dash_render() {
     _sysres_hdr=$(printf " ${BOLD}System Resources${RESET}")
     printf "${BOLD_GREEN}║${RESET}%s" "$_sysres_hdr"
     local _sysres_hdr_s
-    _sysres_hdr_s=$(_strip_ansi "$_sysres_hdr")
+    _strip_ansi_v _sysres_hdr_s "$_sysres_hdr"
     local _sysres_hdr_pad=$(( width - ${#_sysres_hdr_s} - 2 ))
     if (( _sysres_hdr_pad < 0 )); then _sysres_hdr_pad=0; fi
     printf '%*s' "$_sysres_hdr_pad" ""
@@ -9599,7 +9668,7 @@ _dash_render() {
     _sysres_row=$(printf "  ${DIM}%s${RESET}" "$_sysres_data")
     printf "${BOLD_GREEN}║${RESET}%s" "$_sysres_row"
     local _sysres_row_s
-    _sysres_row_s=$(_strip_ansi "$_sysres_row")
+    _strip_ansi_v _sysres_row_s "$_sysres_row"
     local _sysres_row_pad=$(( width - ${#_sysres_row_s} - 2 ))
     if (( _sysres_row_pad < 0 )); then _sysres_row_pad=0; fi
     printf '%*s' "$_sysres_row_pad" ""
@@ -9636,7 +9705,7 @@ _dash_render() {
             _ac_hdr=$(printf " ${BOLD}Active Connections${RESET}")
             printf "${BOLD_GREEN}║${RESET}%s" "$_ac_hdr"
             local _ac_hdr_s
-            _ac_hdr_s=$(_strip_ansi "$_ac_hdr")
+            _strip_ansi_v _ac_hdr_s "$_ac_hdr"
             local _ac_hdr_pad=$(( width - ${#_ac_hdr_s} - 2 ))
             if (( _ac_hdr_pad < 0 )); then _ac_hdr_pad=0; fi
             printf '%*s' "$_ac_hdr_pad" ""
@@ -9648,7 +9717,7 @@ _dash_render() {
                 _ac_row=$(printf "  ${DIM}%s %s${RESET}  %s" "$_ac_n" "$_ac_p" "$_ac_d")
                 printf "${BOLD_GREEN}║${RESET}%s" "$_ac_row"
                 local _ac_row_s
-                _ac_row_s=$(_strip_ansi "$_ac_row")
+                _strip_ansi_v _ac_row_s "$_ac_row"
                 local _ac_pad=$(( width - ${#_ac_row_s} - 2 ))
                 if (( _ac_pad < 0 )); then _ac_pad=0; fi
                 printf '%*s' "$_ac_pad" ""
@@ -9663,8 +9732,7 @@ _dash_render() {
         local _lgname
         for _lgname in "${!_dash_alive[@]}"; do
             (( _log_count >= 2 )) && break
-            local _lf
-            _lf=$(_log_file "$_lgname")
+            local _lf="${LOG_DIR}/${_lgname}.log"
             if [[ -f "$_lf" ]]; then
                 local _ltail
                 _ltail=$(tail -20 "$_lf" 2>/dev/null) || true
@@ -9697,7 +9765,7 @@ _dash_render() {
             _lg_hdr=$(printf " ${BOLD}Recent Log${RESET}")
             printf "${BOLD_GREEN}║${RESET}%s" "$_lg_hdr"
             local _lg_hdr_s
-            _lg_hdr_s=$(_strip_ansi "$_lg_hdr")
+            _strip_ansi_v _lg_hdr_s "$_lg_hdr"
             local _lg_hdr_pad=$(( width - ${#_lg_hdr_s} - 2 ))
             if (( _lg_hdr_pad < 0 )); then _lg_hdr_pad=0; fi
             printf '%*s' "$_lg_hdr_pad" ""
@@ -9709,7 +9777,7 @@ _dash_render() {
                 _lgr=$(printf "  ${DIM}%s${RESET}" "$_lg_row")
                 printf "${BOLD_GREEN}║${RESET}%s" "$_lgr"
                 local _lgr_s
-                _lgr_s=$(_strip_ansi "$_lgr")
+                _strip_ansi_v _lgr_s "$_lgr"
                 local _lgr_pad=$(( width - ${#_lgr_s} - 2 ))
                 if (( _lgr_pad < 0 )); then _lgr_pad=0; fi
                 printf '%*s' "$_lgr_pad" ""
@@ -9727,7 +9795,7 @@ _dash_render() {
     rc_header=$(printf " ${BOLD}Reconnect Log${RESET}")
     printf "${BOLD_GREEN}║${RESET}%s" "$rc_header"
     local rc_hdr_stripped
-    rc_hdr_stripped=$(_strip_ansi "$rc_header")
+    _strip_ansi_v rc_hdr_stripped "$rc_header"
     printf '%*s' "$(( width - ${#rc_hdr_stripped} - 2 ))" ""
     printf "${BOLD_GREEN}║${RESET}\n"
 
@@ -9748,7 +9816,7 @@ _dash_render() {
                     "$_rc_display" "$rc_total" "$rc_last")
                 printf "${BOLD_GREEN}║${RESET}%s" "$rc_row"
                 local rc_stripped
-                rc_stripped=$(_strip_ansi "$rc_row")
+                _strip_ansi_v rc_stripped "$rc_row"
                 local _rc_pad=$(( width - ${#rc_stripped} - 2 ))
                 if (( _rc_pad < 0 )); then _rc_pad=0; fi
                 printf '%*s' "$_rc_pad" ""
@@ -9759,7 +9827,7 @@ _dash_render() {
             local no_rc=" ${DIM}No reconnections recorded${RESET}"
             printf "${BOLD_GREEN}║${RESET}%s" "$no_rc"
             local no_rc_stripped
-            no_rc_stripped=$(_strip_ansi "$no_rc")
+            _strip_ansi_v no_rc_stripped "$no_rc"
             printf '%*s' "$(( width - ${#no_rc_stripped} - 2 ))" ""
             printf "${BOLD_GREEN}║${RESET}\n"
         fi
@@ -9779,12 +9847,16 @@ _dash_render() {
     if [[ -n "${_DASH_LAST_SPEED:-}" ]]; then
         _speed_indicator="  ${DIM}│${RESET}  ${CYAN}${_DASH_LAST_SPEED}${RESET}"
     fi
+    local _dash_ref_rate
+    _dash_ref_rate=$(config_get DASHBOARD_REFRESH 5)
+    local _dash_time_str
+    printf -v _dash_time_str '%(%H:%M:%S)T' -1
     local sys_row
     sys_row=$(printf " ${DIM}IP:${RESET} ${BOLD}%s${RESET}  ${DIM}│${RESET}  ${DIM}Refresh:${RESET} %ss%s%s  ${DIM}│${RESET}  ${DIM}%s${RESET}" \
-        "$pub_ip" "$(config_get DASHBOARD_REFRESH 3)" "$_tg_indicator" "$_speed_indicator" "$(date '+%H:%M:%S')")
+        "$pub_ip" "$_dash_ref_rate" "$_tg_indicator" "$_speed_indicator" "$_dash_time_str")
     printf "${BOLD_GREEN}║${RESET}%s" "$sys_row"
     local sys_stripped
-    sys_stripped=$(_strip_ansi "$sys_row")
+    _strip_ansi_v sys_stripped "$sys_row"
     local _sys_pad=$(( width - ${#sys_stripped} - 2 ))
     if (( _sys_pad < 0 )); then _sys_pad=0; fi
     printf '%*s' "$_sys_pad" ""
@@ -9803,7 +9875,7 @@ _dash_render() {
     ctrl_row=$(printf " ${CYAN}s${RESET}=start ${CYAN}t${RESET}=stop ${CYAN}r${RESET}=restart ${CYAN}c${RESET}=create ${CYAN}p${RESET}=speed ${CYAN}g${RESET}=qlty ${CYAN}q${RESET}=quit%s" "$_pg_hint")
     printf "${BOLD_GREEN}║${RESET}%s" "$ctrl_row"
     local ctrl_stripped
-    ctrl_stripped=$(_strip_ansi "$ctrl_row")
+    _strip_ansi_v ctrl_stripped "$ctrl_row"
     local _ctrl_pad=$(( width - ${#ctrl_stripped} - 2 ))
     if (( _ctrl_pad < 0 )); then _ctrl_pad=0; fi
     printf '%*s' "$_ctrl_pad" ""
@@ -9818,7 +9890,7 @@ _dash_render() {
 
 show_dashboard() {
     local refresh
-    refresh=$(config_get DASHBOARD_REFRESH 3)
+    refresh=$(config_get DASHBOARD_REFRESH 5)
     if (( refresh < 1 )); then refresh=1; fi
 
     # Enter alternate screen buffer
@@ -9858,6 +9930,11 @@ show_dashboard() {
         _DASH_PUB_IP=$(ip -4 route get 1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}') || true
     fi
     : "${_DASH_PUB_IP:=unknown}"
+
+    # Cache terminal height — updated on SIGWINCH, not every frame
+    declare -g _DASH_TERM_H
+    _DASH_TERM_H=$(tput lines 2>/dev/null) || _DASH_TERM_H=40
+    trap '_DASH_TERM_H=$(tput lines 2>/dev/null) || _DASH_TERM_H=40' WINCH
     local _dash_rot_count=0
     local _dash_tg_count=0
 
