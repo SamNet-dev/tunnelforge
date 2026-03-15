@@ -2675,3 +2675,9 @@ TunnelForge شامل سیستم آموزشی تعاملی است (کلید `l` �
 حق نشر (C) ۲۰۲۶ **SamNet Technologies, LLC**
 
 </div>
+
+## 💖 Support
+
+If this project helps you, consider supporting continued development:
+
+**[samnet.dev/donate](https://www.samnet.dev/donate/)**
